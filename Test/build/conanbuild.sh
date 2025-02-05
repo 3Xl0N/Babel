@@ -1,1 +1,0 @@
-. "/Users/jeancharleshouinato/Rattrapage-promo-2027/build/conanbuildenv-release-armv8.sh"
