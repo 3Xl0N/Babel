@@ -1,0 +1,742 @@
+Bonjour je veux que tu me fasses les différentes exigences suivantes
+A C++ abstraction of PortAudio and any sound-related code.
+A C++ abstraction of Opus, and the transmission of compressed sound
+A network abstraction implemented in terms of Asio
+J'ai déjà tout le code
+-client.hpp:
+#ifndef CLIENT_HPP
+#define CLIENT_HPP
+
+#include <vector>
+#include <string>
+#include <thread>
+#include <atomic>
+#include <asio.hpp>
+#include <portaudio.h>
+#include <mutex>
+#include <queue>
+#include <cstdlib>
+#include <atomic>
+
+// --- Simple lock-free ring buffer template ---
+template<typename T, size_t Size>
+class RingBuffer {
+public:
+    RingBuffer() : head(0), tail(0) {}
+    bool push(const T &item) {
+        size_t current_head = head.load(std::memory_order_relaxed);
+        size_t next_head = (current_head + 1) % Size;
+        if (next_head == tail.load(std::memory_order_acquire))
+            return false; // Buffer full
+        buffer[current_head] = item;
+        head.store(next_head, std::memory_order_release);
+        return true;
+    }
+    bool pop(T &item) {
+        size_t current_tail = tail.load(std::memory_order_relaxed);
+        if (current_tail == head.load(std::memory_order_acquire))
+            return false; // Buffer empty
+        item = buffer[current_tail];
+        tail.store((current_tail + 1) % Size, std::memory_order_release);
+        return true;
+    }
+private:
+    T buffer[Size];
+    std::atomic<size_t> head, tail;
+};
+
+class Client {
+public:
+    Client(asio::io_context& io_context, const std::string& server_ip, unsigned short server_port);
+    ~Client();
+    
+    void start();
+    void stop();
+    
+    // Network I/O
+    void do_read();
+    void do_write(const std::vector<char>& data);
+    
+    // Dummy encoding/decoding (replace with Opus routines)
+    std::vector<char> encode_audio(const std::vector<float>& input);
+    std::vector<float> decode_audio(const std::vector<char>& input);
+    
+    // Audio playback function (invoked by network receive processing)
+    void audio_playback(const std::vector<float>& audioData);
+    
+    // PortAudio callbacks for input and output
+    static int paInputCallback(const void *input, void * /*output*/,
+                               unsigned long frameCount,
+                               const PaStreamCallbackTimeInfo *timeInfo,
+                               PaStreamCallbackFlags statusFlags,
+                               void *userData);
+    static int paOutputCallback(const void * /*input*/, void *output,
+                                unsigned long frameCount,
+                                const PaStreamCallbackTimeInfo *timeInfo,
+                                PaStreamCallbackFlags statusFlags,
+                                void *userData);
+    
+    // Processing threads: one for network send (using captured data) and one for network receive.
+    void network_send_thread();
+    void network_receive_thread();  // For simplicity, assume do_read() posts decoded data to playbackBuffer.
+    
+    // Ring buffers for decoupling audio processing:
+    RingBuffer<std::vector<float>, 256> captureBuffer;   // Captured raw audio blocks
+    RingBuffer<std::vector<float>, 256> playbackBuffer;  // Audio blocks to be played back
+    RingBuffer<std::vector<char>, 256> networkQueue;     // Encoded data ready to be sent
+    
+    // ASIO & PortAudio objects.
+    asio::io_context& io_context_;
+    asio::ip::tcp::socket socket_;
+    PaStream* inputStream_;
+    PaStream* outputStream_;
+    
+    // Threads.
+    std::thread netSendThread_;
+    std::thread netReceiveThread_;
+    
+    // Atomic flag.
+    std::atomic<bool> running_;
+    
+    enum { max_length = 4096 };
+    char read_buffer_[max_length];
+};
+
+#endif // CLIENT_HPP
+
+-client.cpp:
+
+#include "client.hpp"
+#include <iostream>
+#include <cstring>
+#include <chrono>
+#include <thread>
+#include <cstdio>
+#include <vector>
+#include <asio.hpp>
+#include <portaudio.h>
+#include <opus/opus.h>
+
+// Paramètres audio
+constexpr int SAMPLE_RATE = 48000;
+// Utiliser une taille de trame valide pour Opus : 960 (20 ms à 48 kHz) est couramment utilisée.
+constexpr unsigned long FRAMES_PER_BUFFER = 960;
+constexpr int CHANNELS = 1;
+
+// --- Variables globales pour Opus ---
+OpusEncoder* opus_encoder = nullptr;
+OpusDecoder* opus_decoder = nullptr;
+
+// --- Fonction d'initialisation d'Opus ---
+bool init_opus() {
+    int error;
+    opus_encoder = opus_encoder_create(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION_VOIP, &error);
+    if (error != OPUS_OK) {
+        std::cerr << "Erreur lors de la création de l'encodeur Opus: " << opus_strerror(error) << std::endl;
+        return false;
+    }
+    opus_decoder = opus_decoder_create(SAMPLE_RATE, CHANNELS, &error);
+    if (error != OPUS_OK) {
+        std::cerr << "Erreur lors de la création du décodeur Opus: " << opus_strerror(error) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// -----------------
+// Constructeur
+// -----------------
+Client::Client(asio::io_context& io_context, const std::string& server_ip, unsigned short server_port)
+    : io_context_(io_context), socket_(io_context), running_(false),
+      inputStream_(nullptr), outputStream_(nullptr)
+{
+    asio::ip::tcp::endpoint endpoint(asio::ip::address::from_string(server_ip), server_port);
+    socket_.async_connect(endpoint, [this](std::error_code ec) {
+        if (!ec) {
+            std::cout << "Connecté au serveur.\n";
+            do_read();
+        } else {
+            std::cerr << "Erreur de connexion: " << ec.message() << "\n";
+        }
+    });
+}
+
+// -----------------
+// Destructeur
+// -----------------
+Client::~Client() {
+    stop();
+}
+
+// -----------------
+// Méthode start : Initialise PortAudio, Opus et démarre les threads réseau
+// -----------------
+void Client::start() {
+    if (!init_opus()) {
+        std::cerr << "Initialisation d'Opus échouée.\n";
+        return;
+    }
+    
+    PaError err = Pa_Initialize();
+    if (err != paNoError) {
+        std::cerr << "Erreur PortAudio: " << Pa_GetErrorText(err) << "\n";
+        return;
+    }
+    
+    // Configuration du flux d'entrée (capture)
+    PaStreamParameters inputParams;
+    inputParams.device = Pa_GetDefaultInputDevice();
+    if (inputParams.device == paNoDevice) {
+        std::cerr << "Aucun périphérique d'entrée par défaut.\n";
+        return;
+    }
+    inputParams.channelCount = CHANNELS;
+    inputParams.sampleFormat = paFloat32;
+    inputParams.suggestedLatency = Pa_GetDeviceInfo(inputParams.device)->defaultHighInputLatency;
+    inputParams.hostApiSpecificStreamInfo = nullptr;
+    
+    err = Pa_OpenStream(&inputStream_, &inputParams, nullptr, SAMPLE_RATE,
+                        FRAMES_PER_BUFFER, paClipOff, paInputCallback, this);
+    if (err != paNoError) {
+        std::cerr << "Échec de l'ouverture du flux d'entrée: " << Pa_GetErrorText(err) << "\n";
+        return;
+    }
+    
+    // Configuration du flux de sortie (lecture)
+    PaStreamParameters outputParams;
+    outputParams.device = Pa_GetDefaultOutputDevice();
+    if (outputParams.device == paNoDevice) {
+        std::cerr << "Aucun périphérique de sortie par défaut.\n";
+        return;
+    }
+    outputParams.channelCount = CHANNELS;
+    outputParams.sampleFormat = paFloat32;
+    outputParams.suggestedLatency = Pa_GetDeviceInfo(outputParams.device)->defaultLowOutputLatency;
+    outputParams.hostApiSpecificStreamInfo = nullptr;
+    
+    err = Pa_OpenStream(&outputStream_, nullptr, &outputParams, SAMPLE_RATE,
+                        FRAMES_PER_BUFFER, paClipOff, paOutputCallback, this);
+    if (err != paNoError) {
+        std::cerr << "Échec de l'ouverture du flux de sortie: " << Pa_GetErrorText(err) << "\n";
+        return;
+    }
+    
+    err = Pa_StartStream(inputStream_);
+    if (err != paNoError) {
+        std::cerr << "Échec du démarrage du flux d'entrée: " << Pa_GetErrorText(err) << "\n";
+        return;
+    }
+    err = Pa_StartStream(outputStream_);
+    if (err != paNoError) {
+        std::cerr << "Échec du démarrage du flux de sortie: " << Pa_GetErrorText(err) << "\n";
+        return;
+    }
+    
+    running_ = true;
+    // Démarrer les threads d'envoi et de réception réseau.
+    netSendThread_ = std::thread(&Client::network_send_thread, this);
+    netReceiveThread_ = std::thread(&Client::network_receive_thread, this);
+}
+
+// -----------------
+// Méthode stop : Nettoie les streams, le socket, les threads et libère les ressources Opus
+// -----------------
+void Client::stop() {
+    running_ = false;
+    if (netSendThread_.joinable())
+        netSendThread_.join();
+    if (netReceiveThread_.joinable())
+        netReceiveThread_.join();
+    if (socket_.is_open()) {
+        std::error_code ec;
+        socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+        socket_.close(ec);
+    }
+    if (inputStream_) {
+        Pa_StopStream(inputStream_);
+        Pa_CloseStream(inputStream_);
+        inputStream_ = nullptr;
+    }
+    if (outputStream_) {
+        Pa_StopStream(outputStream_);
+        Pa_CloseStream(outputStream_);
+        outputStream_ = nullptr;
+    }
+    Pa_Terminate();
+    
+    if (opus_encoder) {
+        opus_encoder_destroy(opus_encoder);
+        opus_encoder = nullptr;
+    }
+    if (opus_decoder) {
+        opus_decoder_destroy(opus_decoder);
+        opus_decoder = nullptr;
+    }
+}
+
+// -----------------
+// Callback d'entrée PortAudio : capture l'audio et pousse dans captureBuffer.
+int Client::paInputCallback(const void *input, void * /*output*/,
+                            unsigned long frameCount,
+                            const PaStreamCallbackTimeInfo * /*timeInfo*/,
+                            PaStreamCallbackFlags statusFlags,
+                            void *userData)
+{
+    Client *client = static_cast<Client *>(userData);
+    if (!input)
+        return paContinue;
+    
+    if (statusFlags & paInputOverflow)
+        std::cerr << "Warning: Débordement d'entrée.\n";
+    
+    const float *in = static_cast<const float *>(input);
+    // Créer un vecteur avec les données capturées (taille = frameCount * CHANNELS)
+    std::vector<float> block(in, in + frameCount * CHANNELS);
+    
+    if (!client->captureBuffer.push(block))
+        std::cerr << "Warning: Capture buffer plein, bloc abandonné.\n";
+    
+    return paContinue;
+}
+
+// -----------------
+// Callback de sortie PortAudio : récupère l'audio depuis playbackBuffer pour lecture.
+int Client::paOutputCallback(const void * /*input*/, void *output,
+                             unsigned long frameCount,
+                             const PaStreamCallbackTimeInfo * /*timeInfo*/,
+                             PaStreamCallbackFlags /*statusFlags*/,
+                             void *userData)
+{
+    Client *client = static_cast<Client *>(userData);
+    float *out = static_cast<float *>(output);
+    std::vector<float> block;
+    
+    if (client->playbackBuffer.pop(block)) {
+        size_t samples_needed = frameCount * CHANNELS;
+        if (block.size() < samples_needed)
+            block.resize(samples_needed, 0.0f);
+        std::memcpy(out, block.data(), samples_needed * sizeof(float));
+    } else {
+        std::memset(out, 0, frameCount * CHANNELS * sizeof(float));
+    }
+    
+    return paContinue;
+}
+
+// -----------------
+// Thread d'envoi réseau : encode l'audio capturé et envoie sur le réseau.
+void Client::network_send_thread() {
+    while (running_) {
+        std::vector<float> block;
+        if (captureBuffer.pop(block)) {
+            auto encoded = encode_audio(block);
+            networkQueue.push(encoded);
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        
+        std::vector<char> data;
+        if (networkQueue.pop(data)) {
+            io_context_.post([this, data]() {
+                do_write(data);
+            });
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+}
+
+// -----------------
+// Thread de réception réseau : lit les données, décode et pousse dans playbackBuffer.
+void Client::network_receive_thread() {
+    while (running_) {
+        std::error_code ec;
+        size_t len = socket_.read_some(asio::buffer(read_buffer_, max_length), ec);
+        if (ec) {
+            std::cerr << "Erreur de lecture: " << ec.message() << "\n";
+            stop();
+            break;
+        }
+        if (len > 0) {
+            std::vector<char> encoded_data(read_buffer_, read_buffer_ + len);
+            auto decoded = decode_audio(encoded_data);
+            if (!playbackBuffer.push(decoded))
+                std::cerr << "Warning: Playback buffer plein, bloc abandonné.\n";
+        }
+    }
+}
+
+// -----------------
+// Lecture asynchrone (si nécessaire)
+void Client::do_read() {
+    socket_.async_read_some(asio::buffer(read_buffer_, max_length),
+        [this](std::error_code ec, std::size_t length) {
+            if (!ec) {
+                if (length % sizeof(float) != 0) {
+                    std::cerr << "Paquet audio incomplet reçu. Abandon du paquet.\n";
+                    do_read();
+                    return;
+                }
+                std::vector<char> encoded_data(read_buffer_, read_buffer_ + length);
+                auto decoded = decode_audio(encoded_data);
+                if (!playbackBuffer.push(decoded))
+                    std::cerr << "Warning: Playback buffer plein, paquet abandonné.\n";
+                do_read();
+            } else {
+                std::cerr << "Erreur de lecture: " << ec.message() << "\n";
+                stop();
+            }
+        });
+}
+
+// -----------------
+// Fonction d'écriture réseau : envoie des données sur le socket.
+void Client::do_write(const std::vector<char>& data) {
+    asio::async_write(socket_, asio::buffer(data.data(), data.size()),
+        [this](std::error_code ec, std::size_t /*length*/) {
+            if (ec) {
+                std::cerr << "Erreur d'écriture: " << ec.message() << "\n";
+                if (ec == asio::error::broken_pipe) {
+                    std::cerr << "Broken pipe détecté. Arrêt du client.\n";
+                    stop();
+                }
+            }
+        });
+}
+
+// -----------------
+// Encodage audio avec Opus
+std::vector<char> Client::encode_audio(const std::vector<float>& input) {
+    const int max_data_bytes = 4000;
+    std::vector<unsigned char> output(max_data_bytes);
+    
+    // Le frame_size doit correspondre au nombre d'échantillons par canal (ici FRAMES_PER_BUFFER)
+    int nb_bytes = opus_encode_float(opus_encoder, input.data(), FRAMES_PER_BUFFER, output.data(), max_data_bytes);
+    if (nb_bytes < 0) {
+        std::cerr << "Erreur lors de l'encodage Opus: " << opus_strerror(nb_bytes) << "\n";
+        return {};
+    }
+    return std::vector<char>(reinterpret_cast<char*>(output.data()),
+                             reinterpret_cast<char*>(output.data()) + nb_bytes);
+}
+
+// -----------------
+// Décodage audio avec Opus
+std::vector<float> Client::decode_audio(const std::vector<char>& input) {
+    std::vector<float> output(FRAMES_PER_BUFFER * CHANNELS);
+    int nb_samples = opus_decode_float(opus_decoder,
+                                         reinterpret_cast<const unsigned char*>(input.data()),
+                                         input.size(),
+                                         output.data(),
+                                         FRAMES_PER_BUFFER,
+                                         0);
+    if (nb_samples < 0) {
+        std::cerr << "Erreur lors du décodage Opus: " << opus_strerror(nb_samples) << "\n";
+        return {};
+    }
+    output.resize(nb_samples * CHANNELS);
+    return output;
+}
+
+// -----------------
+// Fonction de lecture audio (playback) via PortAudio (si nécessaire)
+// Ici, cette fonction est utilisée par le callback de sortie.
+void Client::audio_playback(const std::vector<float>& audioData) {
+    PaError err = Pa_WriteStream(outputStream_, audioData.data(), static_cast<unsigned long>(audioData.size() / CHANNELS));
+    if (err == paOutputUnderflowed)
+        std::cerr << "Warning: Output underflowed\n";
+    else if (err != paNoError)
+        std::cerr << "Erreur lors de l'écriture du flux audio: " << Pa_GetErrorText(err) << "\n";
+}
+
+-client_session.hpp:
+#ifndef CLIENT_SESSION_HPP
+#define CLIENT_SESSION_HPP
+
+#include <asio.hpp>
+#include <memory>
+#include <vector>
+#include <functional>
+
+// ClientSession encapsulates one client connection.
+class ClientSession : public std::enable_shared_from_this<ClientSession> {
+public:
+    using Ptr = std::shared_ptr<ClientSession>;
+
+    // Construct from an accepted socket.
+    ClientSession(asio::ip::tcp::socket socket);
+
+    asio::ip::tcp::socket& socket();
+
+    // Start asynchronous reading from the socket.
+    // The on_read callback is invoked with any data read.
+    void start(std::function<void(const std::vector<char>&, Ptr)> on_read);
+
+    // Set a callback to be notified on disconnection.
+    void set_on_disconnect(std::function<void(Ptr)> on_disconnect);
+
+    // Write data asynchronously to the client.
+    void do_write(const std::vector<char>& data);
+
+    // Close the connection.
+    void close();
+
+private:
+    void do_read();
+
+    asio::ip::tcp::socket socket_;
+    enum { max_length = 1024 };
+    char data_[max_length];
+
+    std::function<void(const std::vector<char>&, Ptr)> on_read_;
+    std::function<void(Ptr)> on_disconnect_;
+};
+
+#endif // CLIENT_SESSION_HPP
+
+-client_session.cpp:
+
+#include "client_session.hpp"
+#include <iostream>
+#include <cstring>
+
+ClientSession::ClientSession(asio::ip::tcp::socket socket)
+    : socket_(std::move(socket))
+{
+}
+
+asio::ip::tcp::socket& ClientSession::socket() {
+    return socket_;
+}
+
+void ClientSession::start(std::function<void(const std::vector<char>&, Ptr)> on_read) {
+    on_read_ = on_read;
+    do_read();
+}
+
+void ClientSession::set_on_disconnect(std::function<void(Ptr)> on_disconnect) {
+    on_disconnect_ = on_disconnect;
+}
+
+void ClientSession::do_read() {
+    auto self(shared_from_this());
+    socket_.async_read_some(asio::buffer(data_, max_length),
+        [this, self](std::error_code ec, std::size_t length) {
+            if (!ec) {
+                std::vector<char> msg(data_, data_ + length);
+                if (on_read_) {
+                    on_read_(msg, self);
+                }
+                do_read();
+            } else {
+                std::cerr << "Client disconnected: " << ec.message() << "\n";
+                if (on_disconnect_) {
+                    on_disconnect_(self);
+                }
+                close();
+            }
+        });
+}
+
+void ClientSession::do_write(const std::vector<char>& data) {
+    auto self(shared_from_this());
+    asio::async_write(socket_, asio::buffer(data.data(), data.size()),
+        [this, self](std::error_code ec, std::size_t /*length*/) {
+            if (ec) {
+                std::cerr << "Write error: " << ec.message() << "\n";
+                if (on_disconnect_) {
+                    on_disconnect_(self);
+                }
+                close();
+            }
+        });
+}
+
+void ClientSession::close() {
+    std::error_code ec;
+    socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+    socket_.close(ec);
+}
+
+main_client.cpp:
+#include "client.hpp"
+#include <asio.hpp>
+#include <iostream>
+#include <cstdlib>
+
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        std::cerr << "Usage: client <server_ip> <server_port>\n";
+        return 1;
+    }
+    std::string server_ip = argv[1];
+    unsigned short server_port = static_cast<unsigned short>(std::atoi(argv[2]));
+
+    try {
+        asio::io_context io_context;
+        Client client(io_context, server_ip, server_port);
+        client.start();
+        io_context.run();
+    } catch (std::exception& e) {
+        std::cerr << "Exception: " << e.what() << "\n";
+    }
+    return 0;
+}
+
+-server.hpp:
+
+#ifndef SERVER_HPP
+#define SERVER_HPP
+
+#include <asio.hpp>
+#include <memory>
+#include "client_session.hpp"
+
+// The Server class accepts TCP connections and bridges audio data between two clients.
+class Server {
+public:
+    Server(asio::io_context& io_context, unsigned short port);
+
+private:
+    void start_accept();
+
+    asio::ip::tcp::acceptor acceptor_;
+    // We allow two sessions maximum.
+    std::shared_ptr<ClientSession> session1_;
+    std::shared_ptr<ClientSession> session2_;
+};
+
+#endif // SERVER_HPP
+
+-server.cpp:
+
+#include "server.hpp"
+#include "client_session.hpp"
+#include <asio.hpp>
+#include <iostream>
+#include <vector>
+#include <string>
+
+// Fonction utilitaire pour récupérer les adresses IP locales (hors loopback)
+std::vector<std::string> get_local_ips() {
+    std::vector<std::string> ips;
+    try {
+        asio::io_context io_context;
+        // Récupérer le nom de l'hôte de la machine
+        std::string hostname = asio::ip::host_name();
+        // Résoudre le nom de l'hôte pour obtenir les endpoints
+        asio::ip::tcp::resolver resolver(io_context);
+        asio::ip::tcp::resolver::results_type endpoints = resolver.resolve(hostname, "");
+        for (const auto& entry : endpoints) {
+            asio::ip::address addr = entry.endpoint().address();
+            // Exclure l'adresse de loopback (127.0.0.1 ou ::1)
+            if (!addr.is_loopback()) {
+                ips.push_back(addr.to_string());
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Erreur lors de la récupération des IP locales : " << e.what() << std::endl;
+    }
+    return ips;
+}
+
+Server::Server(asio::io_context& io_context, unsigned short port)
+    : acceptor_(io_context, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port))
+{
+    try {
+        // Afficher l'endpoint d'écoute (souvent 0.0.0.0:port)
+        asio::ip::tcp::endpoint localEndpoint = acceptor_.local_endpoint();
+        std::cout << "Serveur en écoute sur " 
+                  << localEndpoint.address().to_string() 
+                  << ":" << localEndpoint.port() << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Erreur lors de la récupération de l'endpoint local : " << e.what() << std::endl;
+    }
+
+    // Afficher les adresses IP locales réelles (hors loopback)
+    std::vector<std::string> ips = get_local_ips();
+    if (!ips.empty()) {
+        std::cout << "Adresses IP locales disponibles :" << std::endl;
+        for (const auto& ip : ips) {
+            std::cout << "  " << ip << std::endl;
+        }
+    } else {
+        std::cout << "Aucune adresse IP locale trouvée hors loopback." << std::endl;
+    }
+
+    start_accept();
+}
+
+void Server::start_accept() {
+    acceptor_.async_accept([this](std::error_code ec, asio::ip::tcp::socket socket) {
+        if (!ec) {
+            auto session = std::make_shared<ClientSession>(std::move(socket));
+
+            // Définir un callback pour la déconnexion : si un client se déconnecte, terminer l'appel.
+            session->set_on_disconnect([this](ClientSession::Ptr s) {
+                std::cout << "Un client s'est déconnecté. Fin de l'appel.\n";
+                if (session1_ && session2_) {
+                    session1_->close();
+                    session2_->close();
+                    session1_.reset();
+                    session2_.reset();
+                }
+            });
+
+            // Affecter la première session disponible.
+            if (!session1_) {
+                session1_ = session;
+                std::cout << "Client 1 connecté.\n";
+                session1_->start([this](const std::vector<char>& data, ClientSession::Ptr /*sender*/) {
+                    // Relayer les données vers le client 2 s'il est connecté.
+                    if (session2_) {
+                        session2_->do_write(data);
+                    }
+                });
+            } else if (!session2_) {
+                session2_ = session;
+                std::cout << "Client 2 connecté.\n";
+                session2_->start([this](const std::vector<char>& data, ClientSession::Ptr /*sender*/) {
+                    // Relayer les données vers le client 1 s'il est connecté.
+                    if (session1_) {
+                        session1_->do_write(data);
+                    }
+                });
+            } else {
+                // Rejeter toute connexion supplémentaire au-delà de deux.
+                std::cerr << "Connexion rejetée : déjà deux clients connectés.\n";
+                session->close();
+            }
+        } else {
+            std::cerr << "Erreur d'acceptation : " << ec.message() << "\n";
+        }
+        // Continuer à accepter si une session est disponible.
+        if (!session1_ || !session2_) {
+            start_accept();
+        }
+    });
+}
+
+-main_server.cpp:
+#include "server.hpp"
+#include <asio.hpp>
+#include <iostream>
+#include <cstdlib>
+
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        std::cerr << "Usage: server <port>\n";
+        return 1;
+    }
+    unsigned short port = static_cast<unsigned short>(std::atoi(argv[1]));
+
+    try {
+        asio::io_context io_context;
+        Server server(io_context, port);
+        io_context.run();
+    } catch (std::exception& e) {
+        std::cerr << "Exception: " << e.what() << "\n";
+    }
+
+    return 0;
+}

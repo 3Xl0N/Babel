@@ -1,0 +1,4 @@
+/Users/jeancharleshouinato/Babel/Test/build/CMakeFiles/server.dir
+/Users/jeancharleshouinato/Babel/Test/build/CMakeFiles/client.dir
+/Users/jeancharleshouinato/Babel/Test/build/CMakeFiles/edit_cache.dir
+/Users/jeancharleshouinato/Babel/Test/build/CMakeFiles/rebuild_cache.dir
