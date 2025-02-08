@@ -4,20 +4,22 @@ project(VoiceChat LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Conan integration: Use toolchain via command line for Conan 2.x
-# (Don't include conan_toolchain.cmake here if passing via command line)
+# Option 2 : Inclure le toolchain Conan depuis le répertoire de build
+include(${CMAKE_BINARY_DIR}/conan_toolchain.cmake)
 
-# Add custom module path so CMake can find FindPortAudio.cmake
+# Ajouter le chemin du module personnalisé pour que CMake trouve FindPortAudio.cmake et FindOpus.cmake
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
 
-# Find system PortAudio using the custom module.
+# Recherche de PortAudio (via votre module personnalisé)
 find_package(PortAudio REQUIRED)
 
-# Find Conan-managed dependencies.
-find_package(asio REQUIRED)
+# Recherche d'Opus (via votre module personnalisé FindOpus.cmake)
 find_package(Opus REQUIRED)
 
-# Server executable
+# Recherche d'asio (géré par Conan)
+find_package(asio REQUIRED)
+
+# Définition de la cible serveur
 add_executable(server
     server.cpp
     main_server.cpp
@@ -25,17 +27,17 @@ add_executable(server
 )
 target_link_libraries(server PRIVATE 
     asio::asio 
-    Opus::opus
+    ${Opus_LIBRARIES}
 )
 
-# Client executable
+# Définition de la cible client
 add_executable(client
     client.cpp
     main_client.cpp
 )
 target_link_libraries(client PRIVATE 
     asio::asio 
-    Opus::opus 
-    ${PortAudio_LIBRARIES}  # Use the variable set by FindPortAudio.cmake
+    ${Opus_LIBRARIES} 
+    ${PortAudio_LIBRARIES}
 )
-target_include_directories(client PRIVATE ${PortAudio_INCLUDE_DIRS})
+target_include_directories(client PRIVATE ${PortAudio_INCLUDE_DIRS} ${Opus_INCLUDE_DIRS})
