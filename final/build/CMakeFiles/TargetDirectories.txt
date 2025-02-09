@@ -1,8 +1,0 @@
-/Users/jeancharleshouinato/abstract/build/CMakeFiles/edit_cache.dir
-/Users/jeancharleshouinato/abstract/build/CMakeFiles/rebuild_cache.dir
-/Users/jeancharleshouinato/abstract/build/client/CMakeFiles/VoiceClient.dir
-/Users/jeancharleshouinato/abstract/build/client/CMakeFiles/edit_cache.dir
-/Users/jeancharleshouinato/abstract/build/client/CMakeFiles/rebuild_cache.dir
-/Users/jeancharleshouinato/abstract/build/server/CMakeFiles/VoiceServer.dir
-/Users/jeancharleshouinato/abstract/build/server/CMakeFiles/edit_cache.dir
-/Users/jeancharleshouinato/abstract/build/server/CMakeFiles/rebuild_cache.dir

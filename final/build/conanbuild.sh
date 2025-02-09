@@ -1,1 +1,0 @@
-. "/Users/jeancharleshouinato/abstract/build/conanbuildenv-release-armv8.sh"
