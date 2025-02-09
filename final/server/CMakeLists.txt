@@ -18,7 +18,7 @@ target_link_libraries(VoiceServer PRIVATE
 
 # Dépendances système
 if(WIN32)
-    target_link_libraries(VoiceServer PRIVATE ws2_32)
+    target_link_libraries(VoiceServer PRIVATE ws2_32 mswsock)
 else()
     target_link_libraries(VoiceServer PRIVATE pthread)
 endif()
