@@ -1,0 +1,116 @@
+Salut
+J'ai mon cmake crossplatform qui fontionne bien sur les MAc intel et silicon et linux.
+Je compile avec conan et cmake et mon cmake recherche sur l'appareil la lib portaudio.h.
+Mais sur Windows celà ne marche pas mais sur les autres oui.
+On m'a dit que sur Windows il faut cloner un repo github et le mettre à la racine du disque C.
+Ce repo contient un dossier include avec les .h de portaudio.
+Mais mon cmake ne le retrouve pas sur windows. Dans les cas de Linux et Mac os la lib est recherchée dans le système.
+Voici les fichiers:
+-Cmake(racine):
+cmake_minimum_required(VERSION 3.15)
+project(VoiceChat LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Include Conan-generated toolchain
+if(EXISTS "${CMAKE_BINARY_DIR}/conan_toolchain.cmake")
+    include("${CMAKE_BINARY_DIR}/conan_toolchain.cmake")
+endif()
+
+add_subdirectory(client)
+add_subdirectory(server)
+
+-cmake(server):
+add_executable(VoiceServer
+    src/ClientSession.cpp
+    src/Server.cpp
+    src/main_server.cpp
+)
+
+# Ajout de la dépendance ASIO via Conan
+find_package(asio REQUIRED CONFIG)
+
+target_include_directories(VoiceServer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# Lien avec ASIO (header-only mais nécessaire pour les includes)
+target_link_libraries(VoiceServer PRIVATE
+    asio::asio
+)
+
+# Dépendances système
+if(WIN32)
+    target_link_libraries(VoiceServer PRIVATE ws2_32)
+else()
+    target_link_libraries(VoiceServer PRIVATE pthread)
+endif()
+
+cmake(client):
+# Trouver PortAudio
+find_path(PORTAUDIO_INCLUDE_DIR portaudio.h
+    PATHS
+    /usr/include
+    /usr/local/include
+    /opt/homebrew/include # Apple Silicon
+    /opt/local/include # MacPorts
+    "C:/portaudio/include" # Windows
+)
+
+find_library(PORTAUDIO_LIBRARY
+    NAMES portaudio portaudio_x64
+    PATHS
+    /usr/lib
+    /usr/local/lib
+    /opt/homebrew/lib # Apple Silicon
+    /opt/local/lib # MacPorts
+    "C:/portaudio/lib" # Windows
+)
+
+if(NOT PORTAUDIO_INCLUDE_DIR)
+    message(FATAL_ERROR "PortAudio headers not found! Install with:\n"
+        "  macOS: brew install portaudio\n"
+        "  Linux: sudo apt install portaudio19-dev\n"
+        "  Windows: Download from http://files.portaudio.com/archives/pa_stable_v190700_20210406.tgz")
+endif()
+
+if(NOT PORTAUDIO_LIBRARY)
+    message(FATAL_ERROR "PortAudio library not found! Follow installation instructions above.")
+endif()
+
+# Trouver Opus via Conan
+find_package(Opus REQUIRED CONFIG)
+
+add_executable(VoiceClient
+    src/AudioStream.cpp
+    src/OpusCodec.cpp
+    src/NetworkClient.cpp
+    src/main_client.cpp
+)
+
+target_include_directories(VoiceClient PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PORTAUDIO_INCLUDE_DIR}
+)
+
+target_link_libraries(VoiceClient PRIVATE
+    ${PORTAUDIO_LIBRARY}
+    Opus::opus
+)
+
+# Dépendances spécifiques
+if(APPLE)
+    find_library(AUDIO_TOOLBOX AudioToolbox)
+    find_library(CORE_AUDIO CoreAudio)
+    target_link_libraries(VoiceClient PRIVATE
+        ${AUDIO_TOOLBOX}
+        ${CORE_AUDIO}
+    )
+elseif(WIN32)
+    target_link_libraries(VoiceClient PRIVATE winmm ws2_32)
+else()
+    target_link_libraries(VoiceClient PRIVATE pthread asound)
+endif()
+
+Corrige moi celà une fois pour de bon. En sachant que sur windows j'utilise Mingw pour compiler.

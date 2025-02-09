@@ -1,0 +1,1 @@
+/Library/Developer/CommandLineTools/usr/bin/c++ -stdlib=libc++ -O3 -DNDEBUG -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/VoiceServer.dir/src/ClientSession.cpp.o CMakeFiles/VoiceServer.dir/src/Server.cpp.o CMakeFiles/VoiceServer.dir/src/main_server.cpp.o -o VoiceServer  -lpthread
